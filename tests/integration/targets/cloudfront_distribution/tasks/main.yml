@@ -440,3 +440,5 @@
       enabled: no
       wait: yes
       state: absent
+
+- include: ./cloudfront_info.yml
