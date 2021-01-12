@@ -210,8 +210,13 @@ EXAMPLES = '''
 
 '''
 RETURN = '''
-task:
-  description: The result of the create, accept, reject or delete action.
+peering_id:
+  description: The id of the VPC peering connection created/deleted.
+  returned: always
+  type: str
+  sample: pcx-034223d7c0aec3cde
+vpc_peering_connection:
+  description: The details of the VPC peering connection as returned by Boto3 (snake cased).
   returned: success
   type: dict
 '''
@@ -225,6 +230,7 @@ import traceback
 
 from ansible_collections.amazon.aws.plugins.module_utils.core import AnsibleAWSModule
 from ansible_collections.amazon.aws.plugins.module_utils.core import is_boto3_error_code
+from ansible_collections.amazon.aws.plugins.module_utils.ec2 import camel_dict_to_snake_dict
 
 
 def tags_changed(pcx_id, client, module):
@@ -261,6 +267,7 @@ def describe_peering_connections(params, client):
                 {'Name': 'accepter-vpc-info.vpc-id', 'Values': [params['VpcId']]}
             ]
         )
+
     return result
 
 
@@ -289,16 +296,16 @@ def create_peer_connection(client, module):
         if tags_changed(pcx_id, client, module):
             changed = True
         if is_active(peering_conn):
-            return (changed, peering_conn['VpcPeeringConnectionId'])
+            return (changed, peering_conn)
         if is_pending(peering_conn):
-            return (changed, peering_conn['VpcPeeringConnectionId'])
+            return (changed, peering_conn)
     try:
         peering_conn = client.create_vpc_peering_connection(**params)
         pcx_id = peering_conn['VpcPeeringConnection']['VpcPeeringConnectionId']
         if module.params.get('tags'):
             create_tags(pcx_id, client, module)
         changed = True
-        return (changed, peering_conn['VpcPeeringConnection']['VpcPeeringConnectionId'])
+        return (changed, peering_conn)
     except botocore.exceptions.ClientError as e:
         module.fail_json(msg=str(e))
 
@@ -322,41 +329,32 @@ def remove_peer_connection(client, module):
         params = dict()
         params['VpcPeeringConnectionId'] = pcx_id
         client.delete_vpc_peering_connection(**params)
-        module.exit_json(changed=True)
+        module.exit_json(changed=True, peering_id=pcx_id)
     except botocore.exceptions.ClientError as e:
         module.fail_json(msg=str(e))
 
 
-def peer_status(client, module):
-    params = dict()
-    params['VpcPeeringConnectionIds'] = [module.params.get('peering_id')]
-    try:
-        vpc_peering_connection = client.describe_vpc_peering_connections(**params)
-        return vpc_peering_connection['VpcPeeringConnections'][0]['Status']['Code']
-    except is_boto3_error_code('InvalidVpcPeeringConnectionId.Malformed') as e:  # pylint: disable=duplicate-except
-        module.fail_json(msg='Malformed connection ID: {0}'.format(e), traceback=traceback.format_exc())
-    except botocore.exceptions.ClientError as e:  # pylint: disable=duplicate-except
-        module.fail_json(msg='Error while describing peering connection by peering_id: {0}'.format(e), traceback=traceback.format_exc())
-
-
 def accept_reject(state, client, module):
     changed = False
-    params = dict()
-    params['VpcPeeringConnectionId'] = module.params.get('peering_id')
-    if peer_status(client, module) != 'active':
+    peering_id = module.params.get('peering_id')
+    vpc_peering_connection = find_pcx_by_id(peering_id, client, module)['VpcPeeringConnections'][0]
+    peer_status = vpc_peering_connection['Status']['Code']
+
+    if peer_status != 'active':
         try:
             if state == 'accept':
-                client.accept_vpc_peering_connection(**params)
+                client.accept_vpc_peering_connection(VpcPeeringConnectionId=peering_id)
             else:
-                client.reject_vpc_peering_connection(**params)
+                client.reject_vpc_peering_connection(VpcPeeringConnectionId=peering_id)
             if module.params.get('tags'):
-                create_tags(params['VpcPeeringConnectionId'], client, module)
+                create_tags(peering_id, client, module)
             changed = True
         except botocore.exceptions.ClientError as e:
             module.fail_json(msg=str(e))
-    if tags_changed(params['VpcPeeringConnectionId'], client, module):
+    if tags_changed(peering_id, client, module):
         changed = True
-    return changed, params['VpcPeeringConnectionId']
+
+    return (changed, vpc_peering_connection)
 
 
 def load_tags(module):
@@ -419,7 +417,6 @@ def main():
 
     if state == 'present':
         (changed, results) = create_peer_connection(client, module)
-        module.exit_json(changed=changed, peering_id=results)
     elif state == 'absent':
         if not peering_id and (not vpc_id or not peer_vpc_id):
             module.fail_json(msg='state is absent but one of the following is missing: peering_id or [vpc_id, peer_vpc_id]')
@@ -427,8 +424,9 @@ def main():
         remove_peer_connection(client, module)
     else:
         (changed, results) = accept_reject(state, client, module)
-        module.exit_json(changed=changed, peering_id=results)
 
+    formatted_results = camel_dict_to_snake_dict(results)
+    module.exit_json(changed=changed, vpc_peering_connection=formatted_results, peering_id=results['VpcPeeringConnectionId'])
 
 if __name__ == '__main__':
     main()
